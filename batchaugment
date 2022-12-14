@@ -1,0 +1,241 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+
+import math
+from collections.abc import Sequence
+
+
+class RandomHorizontalFlip(nn.Module):
+    """ Apply random horizontal flip to a batch of videos of shape [B, ..., H, W]
+
+        Args:
+            p (float): Probability that the random horizontal flip operation will be performed for each video
+    """
+    def __init__(self, p=0.5):
+        super(RandomHorizontalFlip, self).__init__()
+        self.p = p
+
+    def forward(self, x):
+        x_out = []
+        x = x.unbind(0)
+
+        for v in x:
+            v_out = v.flip(-1) if (torch.rand(1) < self.p) else v
+            x_out.append(v_out)
+
+        return torch.stack(x_out)
+
+
+class RandomCrop(nn.Module):
+    """ Apply random crop to a batch of videos of shape [B, ..., H, W]
+
+        Args:
+            size (int or sequence of int of length 1 or 2): Desired output size. If size is int or sequence of length 1, a square crop is made.
+            padding (int or sequence of int of length 1, 2, or 4): Size of zero padding for all borders (left/right/top/bottom) of the input.
+            If padding is int, the input value will apply to all borders.
+            If padding is a sequence of length 2, the input values will apply to the left/right and top/bottom borders respectively.
+            If padding is a sequence of length 4, the input values will apply to the left, top, right and bottom borders respectively.
+    """
+    def __init__(self, size, padding):
+        super(RandomCrop, self).__init__()
+        self.size = self._setup_size(size)
+        self.padding = self._parse_pad_padding(padding)
+
+    def _setup_size(self, size):
+        if isinstance(size, int):
+            return size, size
+
+        if isinstance(size, Sequence) & (len(size) == 1):
+            return size[0], size[0]
+
+        return size
+
+    def _parse_pad_padding(self, padding):
+        if isinstance(padding, int):
+            pad_left = pad_right = pad_top = pad_bottom = padding
+        elif len(padding) == 1:
+            pad_left = pad_right = pad_top = pad_bottom = padding[0]
+        elif len(padding) == 2:
+            pad_left = pad_right = padding[0]
+            pad_top = pad_bottom = padding[1]
+        else:
+            pad_left = padding[0]
+            pad_top = padding[1]
+            pad_right = padding[2]
+            pad_bottom = padding[3]
+
+        return [pad_left, pad_right, pad_top, pad_bottom]
+
+    def forward(self, x):
+        # pads input with zeroes
+        x = torch.nn.functional.pad(x, self.padding, mode='constant', value=0.)
+
+        _, _, _, H, W = x.shape
+        H_out, W_out = self.size
+
+        if (H + 1 < H_out) | (W + 1 < W_out):
+            raise ValueError(f"Required crop size {(H_out, W_out)} is larger then input size {(H, W)}")
+
+        if  (H == H_out) & (W == W_out):
+            return x
+
+        x_out = []
+        x = x.unbind(0)
+
+        for v in x:
+            top = torch.randint(0, H - H_out + 1, size=(1,)).item()
+            left = torch.randint(0, W - W_out + 1, size=(1,)).item()
+            v_out = v[..., top:(top+H_out), left:(left+W_out)]
+            x_out.append(v_out)
+
+        return torch.stack(x_out)
+
+
+class RandomResizedCrop(nn.Module):
+    """ Apply random resized crop to a batch of videos of shape [B, ..., H, W].
+
+        Args:
+            size (int or sequence of int of length 1 or 2): Desired output size. If size is int or sequence of length 1, a square crop is made.
+            scale (sequence of float of length 2): Lower and upper bounds for proportion of random area of crop against input video
+            ratio (sequence of float of length 2): Lower and upper bounds for random aspect ratio of crop
+            interpolation (InterpolationMode): Algorithm for upsampling: 'bilinear', 'nearest'. Default:'bilinear'
+    """
+    def __init__(self, size, scale=(0.08, 1.0), ratio=(3.0 / 4.0, 4.0 / 3.0), interpolation='bilinear'):
+        super(RandomResizedCrop, self).__init__()
+        self.size = self._setup_size(size)
+        self.scale = scale
+        self.ratio = ratio
+        self.interpolation = interpolation
+
+    def _setup_size(self, size):
+        if isinstance(size, int):
+            return size, size
+
+        if isinstance(size, Sequence) & (len(size) == 1):
+            return size[0], size[0]
+
+        return size
+
+    def _get_params(self, H, W, area, scale, ratio):
+        log_ratio = torch.log(torch.tensor(ratio))
+
+        for _ in range(10):
+            target_area = area * torch.empty(1).uniform_(scale[0], scale[1]).item()
+            aspect_ratio = torch.exp(torch.empty(1).uniform_(log_ratio[0], log_ratio[1])).item()
+
+            h = int(round(math.sqrt(target_area / aspect_ratio)))
+            w = int(round(math.sqrt(target_area * aspect_ratio)))
+
+            if (0 < h <= H) & (0 < w <= W):
+                i = torch.randint(0, H - h + 1, size=(1,)).item()
+                j = torch.randint(0, W - w + 1, size=(1,)).item()
+                return i, j, h, w
+
+        # Fallback to central crop
+        in_ratio = W/H
+        if in_ratio < min(ratio):
+            w = W
+            h = int(round(w / min(ratio)))
+        elif in_ratio > max(ratio):
+            h = H
+            w = int(round(h * max(ratio)))
+        else:  # whole image
+            h, w = H, W
+
+        i = (H - h) // 2
+        j = (W - w) // 2
+        return i, j, h, w
+
+    def forward(self, x):
+        _, _, _, H, W = x.shape
+        area = H * W
+
+        x_out = []
+        x = x.unbind(0)
+
+        for v in x:
+            # crop
+            top, left, H_out, W_out = self._get_params(H, W, area, self.scale, self.ratio)
+            v_out = v[..., top:(top+H_out), left:(left+W_out)]
+
+            # resize
+            if (H_out, W_out) != self.size:
+                v_out = F.interpolate(v_out, size=self.size, mode=self.interpolation, align_corners=False)
+
+            x_out.append(v_out)
+
+        return torch.stack(x_out)
+
+
+class RandomErasing(nn.Module):
+    """ Apply random erasing to a batch of videos of shape [B, ..., H, W].
+
+        Args:
+            p (float between 0 and 1): Probability that the random erasing operation will be performed for each video
+            scale (sequence of float of length 2): Lower and upper bounds for proportion of erased area against input video
+            ratio (sequence of float of length 2): Lower and upper bounds for random aspect ratio of erased area
+            value (float): Erasing value. Default: 0.
+    """
+    def __init__(self, p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0.):
+        super(RandomErasing, self).__init__()
+        self.p = p
+        self.scale = scale
+        self.ratio = ratio
+        self.value = value
+
+    def _get_params(self, H, W, area, scale, ratio):
+        log_ratio = torch.log(torch.tensor(ratio))
+
+        for _ in range(10):
+            erase_area = area * torch.empty(1).uniform_(scale[0], scale[1]).item()
+            aspect_ratio = torch.exp(torch.empty(1).uniform_(log_ratio[0], log_ratio[1])).item()
+
+            h = int(round(math.sqrt(erase_area * aspect_ratio)))
+            w = int(round(math.sqrt(erase_area / aspect_ratio)))
+
+            if (h < H) & (w < W):
+                i = torch.randint(0, H - h + 1, size=(1,)).item()
+                j = torch.randint(0, W - w + 1, size=(1,)).item()
+                return i, j, h, w
+
+        return 0, 0, H, W
+
+    def forward(self, x):
+        _, _, _, H, W = x.shape
+        area = H * W
+
+        x = x.unbind(0)
+
+        for v in x:
+            if torch.rand(1) < self.p:
+                top, left, TH, TW = self._get_params(H, W, area, self.scale, self.ratio)
+                v[..., top:(top+TH), left:(left+TW)] = self.value
+
+        return torch.stack(x)
+
+
+class Normalize(nn.Module):
+    """ Normalize batch of videos of shape [B, ..., C, H, W].
+
+        Args:
+            mean (sequence of float of length C): Sequence of means for each channel
+            std (sequence of float of length C): Sequence of standard deviations for each channel
+    """
+    def __init__(self, mean, std):
+        super(Normalize, self).__init__()
+        self.mean = mean
+        self.std = std
+
+    def forward(self, x):
+        mean = torch.as_tensor(self.mean, dtype=x.dtype, device=x.device)
+        std = torch.as_tensor(self.std, dtype=x.dtype, device=x.device)
+
+        if (std == 0).any():
+            raise ValueError(f"std evaluated to zero after conversion to {dtype}, leading to division by zero.")
+
+        mean = mean.view(-1, 1, 1) if (mean.ndim == 1) else mean
+        std = std.view(-1, 1, 1) if (std.ndim == 1) else std
+
+        return x.sub_(mean).div_(std)
